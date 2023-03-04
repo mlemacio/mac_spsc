@@ -3,6 +3,6 @@
 #include "include/spscQueue.h"
 
 auto main() -> int {
-    spsc::spscQueue_t q;
+    spsc::spscQueue_t<int> q;
     return 0;
 }
