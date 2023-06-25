@@ -12,30 +12,26 @@ namespace spsc
     // 1. Manually check if it hits capactiy (Modulo has to do extra work since it checks every multiple)
     // 2. Make capacity a power of two and use bit shifting
 
-    // Re-think if I really need to worry about the whole "no-throw" thing
-    // Probably a speed things tbh
-
-    template <typename T, typename Alloc = std::allocator<std::byte>>
-        requires std::is_nothrow_copy_constructible<T>::value &&
-                 std::is_nothrow_destructible<T>::value
+    template <typename T, typename Alloc = std::allocator<T>>
     class spscQueue_t
     {
     public:
-        explicit spscQueue_t(size_t maxCapacity)
+        explicit spscQueue_t(size_t maxCapacity) : m_capacity{},
+                                                   m_writeIdx{},
+                                                   m_readIdx{},
+                                                   m_rawMemory{}
         {
-            // In theory... maybe this has a use
-            // But for not, just don't let anyone make this
             assert(maxCapacity > 0);
 
             // There's multiple ways to do this, but we need an extra element here
             // to differentiate between empty and full
             m_capacity = maxCapacity + 1;
-            m_rawMemory.resize((m_capacity) * sizeof(T));
+            m_rawMemory.resize(m_capacity);
         }
 
         ~spscQueue_t()
         {
-            while (front().has_value())
+            while (front())
             {
                 pop();
             }
@@ -58,33 +54,61 @@ namespace spsc
             }
 
             new (&m_rawMemory[m_writeIdx]) T(std::forward<Args>(args)...);
-            progressIndex<indexType_e::WRITE>();
+            progress_index<indexType_e::WRITE>();
+        }
+
+        // The throwing version
+        template <typename... Args>
+            requires(std::is_constructible_v<T, Args...> && std::is_nothrow_constructible_v<T, Args...> == false)
+        inline auto emplace(Args &&...args) -> void
+        {
+            std::cout << "Lets maybe throw" << std::endl;
+
+            // Busy wait until we get space
+            while (is_full())
+            {
+            }
+
+            new (&m_rawMemory[m_writeIdx]) T(std::forward<Args>(args)...);
+            progress_index<indexType_e::WRITE>();
         }
 
         template <typename... Args>
-        inline auto tryEmplace(Args &&...args) -> bool
+        inline auto try_emplace(Args &&...args) -> bool
             requires std::is_nothrow_constructible_v<T, Args...>
         {
             if (is_full())
                 return false;
 
             new (&m_rawMemory[m_writeIdx]) T(std::forward<Args>(args)...);
-            progressIndex<indexType_e::WRITE>();
+            progress_index<indexType_e::WRITE>();
 
             return true;
         }
 
-        // TODO: r-value versions of these?
         auto push(const T &val) noexcept -> void
-            requires std::is_nothrow_copy_constructible<T>::value
         {
             emplace(val);
         }
 
-        auto tryPush(const T &val) -> bool
-            requires std::is_nothrow_copy_constructible<T>::value
+        auto try_push(const T &val) -> bool
         {
             return tryEmplace(val);
+        }
+
+        auto take_and_pop() noexcept -> std::optional<T>
+        {
+            if (is_empty())
+                return {};
+
+            // We HAVE to make a copy here since we use a circular buffer
+            // and the data will be invalidated on the next right
+
+            // If you really wanted to not copy, in theory... use unique ptr as the type
+            T valCopy = front().value();
+            pop();
+
+            return valCopy;
         }
 
         auto front() noexcept -> std::optional<std::reference_wrapper<T>>
@@ -92,10 +116,7 @@ namespace spsc
             if (is_empty())
                 return {};
 
-            auto &valueToReturn = reinterpret_cast<T &>(m_rawMemory[m_readIdx]);
-            progressIndex<indexType_e::READ>();
-
-            return valueToReturn;
+            return m_rawMemory[m_readIdx];
         }
 
         auto pop() noexcept -> void
@@ -103,13 +124,18 @@ namespace spsc
             assert(is_empty() == false);
 
             // If these do special work in their dtor(), make sure it's done
-            reinterpret_cast<T &>(m_rawMemory[m_readIdx]).~T();
-            progressIndex<indexType_e::READ>();
+            m_rawMemory[m_readIdx].~T();
+            progress_index<indexType_e::READ>();
         }
 
         auto size() const noexcept -> size_t
         {
-            return m_rawMemory.size() / sizeof(T);
+            // Write index should always be "ahead or equal" relative to read index
+            std::ptrdiff_t diff = m_writeIdx - m_readIdx;
+            if (diff < 0)
+                diff += m_capacity;
+
+            return static_cast<size_t>(diff);
         }
 
         auto is_empty() const noexcept -> bool
@@ -117,9 +143,10 @@ namespace spsc
             return m_writeIdx == m_readIdx;
         }
 
+        // We do it the long way to avoid the modulo
         auto is_full() const noexcept -> bool
         {
-            return ((m_writeIdx + 1) % m_capacity) == m_readIdx;
+            return size() == m_capacity;
         }
 
         auto capacity() const noexcept -> size_t
@@ -128,14 +155,14 @@ namespace spsc
         }
 
     private:
-        enum class indexType_e
+        enum class indexType_e : bool
         {
             READ,
             WRITE
         };
 
         template <indexType_e INDEX_TYPE>
-        constexpr inline auto whichIndex() noexcept -> size_t &
+        constexpr inline auto which_index() noexcept -> size_t &
         {
             if constexpr (INDEX_TYPE == indexType_e::WRITE)
                 return m_writeIdx;
@@ -143,9 +170,9 @@ namespace spsc
         }
 
         template <indexType_e INDEX_TYPE>
-        inline auto progressIndex() noexcept -> void
+        inline auto progress_index() noexcept -> void
         {
-            auto &indexToIncrement = whichIndex<INDEX_TYPE>();
+            auto &indexToIncrement = which_index<INDEX_TYPE>();
 
             // Do it manually to prevent the cost of modulo
             if (indexToIncrement == m_capacity)
@@ -170,12 +197,13 @@ namespace spsc
         // Apple Clang :(
         inline static constexpr std::size_t cacheLineSize = 64;
 #endif
-        size_t m_capacity;
+        size_t m_capacity; // How much memory we're currently holding
+                           // Probably could be simplified into grabbing the m_rawMemory size
 
-        size_t m_writeIdx{0};
-        size_t m_readIdx{0};
+        size_t m_writeIdx; // What location to write to next
+        size_t m_readIdx;  // What location to read from next
 
-        std::vector<std::byte, Alloc> m_rawMemory;
+        std::vector<T, Alloc> m_rawMemory; // The underlying memory
     };
 };
 
